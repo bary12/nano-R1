@@ -1,28 +1,27 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, AutoModelForCausalLM, AutoTokenizer
 from accelerate import Accelerator
 from vllm import LLM, SamplingParams
-from datetime import datetime
+import re
 
 class GRPODataset(Dataset):
-    """Dummy dataset for GRPO training"""
-    def __init__(self, prompts):
-        self.prompts = prompts
+    """Dataset for GRPO training with questions and answers"""
+    def __init__(self, data):
+        self.data = data
 
     def __len__(self):
-        return len(self.prompts)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        return {"prompt": self.prompts[idx]}
+        return {"question": self.data[idx]["question"], "answer": self.data[idx]["answer"]}
 
 class GRPOTrainer:
     def __init__(
         self, 
         model: torch.nn.Module, 
         train_dataset: Dataset,
-        reward_fn,  # Callable: takes (prompts, outputs) -> rewards
         batch_size: int = 8, 
         num_generations: int = 4,
         lr: float = 5e-6,
@@ -33,7 +32,6 @@ class GRPOTrainer:
     ):
         self.model = model.to(device)
         self.train_dataset = train_dataset
-        self.reward_fn = reward_fn
         self.batch_size = batch_size
         self.num_generations = num_generations
         self.lr = lr
@@ -70,15 +68,26 @@ class GRPOTrainer:
         kl_div = F.kl_div(new_log_probs, old_log_probs, reduction="batchmean", log_target=True)
         return loss + self.beta * kl_div
 
+    def reward_function(self, prompts, outputs, answers):
+        """Reward function with format and correctness evaluation"""
+        rewards = []
+        for output, answer in zip(outputs, answers):
+            format_reward = 1.0 if re.match(r"<think>.*</think>\n<answer>.*</answer>", output, re.DOTALL) else 0.0
+            extracted_answer = re.search(r"<answer>(.*?)</answer>", output)
+            correctness_reward = 1.0 if extracted_answer and extracted_answer.group(1).strip() == answer.strip() else 0.0
+            rewards.append(format_reward + correctness_reward)
+        return rewards
+
     def train(self, num_epochs=3):
         dataloader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
         self.model.train()
 
         for epoch in range(num_epochs):
             for batch in dataloader:
-                prompts = batch["prompt"]
+                prompts = batch["question"]
+                answers = batch["answer"]
                 old_outputs = self.generate(prompts)
-                rewards = torch.tensor(self.reward_fn(prompts, old_outputs), dtype=torch.float32).to(self.device)
+                rewards = torch.tensor(self.reward_function(prompts, old_outputs, answers), dtype=torch.float32).to(self.device)
 
                 inputs = self.model.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(self.device)
                 new_outputs = self.model(**inputs, labels=inputs["input_ids"])
@@ -91,18 +100,14 @@ class GRPOTrainer:
 
                 print(f"Epoch {epoch}, Loss: {loss.item()}")
 
-# Example usage
 if __name__ == "__main__":
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
     model.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
 
-    train_data = GRPODataset(["What is the capital of France?", "Solve: 3 + 5"])
-    
-    def reward_function(prompts, outputs):
-        """Simple dummy reward function"""
-        return [1.0 if "Paris" in o or "8" in o else 0.0 for o in outputs]
+    train_data = GRPODataset([
+        {"question": "What is the capital of France?", "answer": "Paris"},
+        {"question": "Solve: 3 + 5", "answer": "8"}
+    ])
 
-    trainer = GRPOTrainer(model, train_data, reward_function, batch_size=2, use_vllm=False)
+    trainer = GRPOTrainer(model, train_data, batch_size=2, use_vllm=False)
     trainer.train(num_epochs=1)
